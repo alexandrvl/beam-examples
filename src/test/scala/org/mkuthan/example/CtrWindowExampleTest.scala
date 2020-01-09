@@ -33,15 +33,14 @@ class CtrWindowExampleTest extends PipelineSpec {
   private val windowDuration = 60
   private val window = new IntervalWindow(baseTime, JDuration.standardSeconds(windowDuration + 30))
 
-  private val impressionsSubscription = "impressions-subscription"
-  private val clicksSubscription = "clicks-subscription"
+  private val eventsSubscription = "events-subscription"
   private val ctrsTopic = "ctrs-topic"
 
   private val anyClient = ClientId("any client id")
   private val anyAd = AdId("any ad id")
-  private val anyImpression = Impression(anyClient, anyAd)
-  private val anyClick = Click(anyClient, anyAd)
-  private val anyCtr = Ctr(anyClient, anyAd)
+  private val anyImpression = Event.impression(anyClient, anyAd)
+  private val anyClick = Event.click(anyClient, anyAd)
+  private val anyCtr = Event(anyClient, anyAd)
 
   "CTR" should "be calculated from clicks and impressions" in {
 
@@ -51,28 +50,30 @@ class CtrWindowExampleTest extends PipelineSpec {
     JobTest[CtrWindowExample.type]
       .args(
         s"--$WindowDurationConf=$windowDuration",
-        s"--$ImpressionsSubscriptionConf=$impressionsSubscription",
-        s"--$ClicksSubscriptionConf=$clicksSubscription",
+        s"--$EventsSubscriptionConf=$eventsSubscription",
         s"--$CtrsTopicConf=$ctrsTopic")
       .inputStream(
-        PubsubIO[Impression](impressionsSubscription), testStreamOf[Impression]
+        PubsubIO.readCoder[Event](eventsSubscription), testStreamOf[Event]
           .advanceWatermarkTo(baseTime)
           .addElements(anyImpression.copy(ad = adOneId))
-          .advanceWatermarkTo(baseTimePlus(10 seconds))
+          .advanceWatermarkTo(baseTimePlus(1 seconds))
           .addElements(anyImpression.copy(ad = adTwoId))
-          .advanceWatermarkToInfinity())
-      .inputStream(
-        PubsubIO[Click](clicksSubscription), testStreamOf[Click]
+          .advanceWatermarkTo(baseTimePlus(10 seconds))
+          .addElements(anyImpression.copy(ad = adTwoId)) // second Ad2 impression
           .advanceWatermarkTo(baseTimePlus(30 seconds))
           .addElements(anyClick.copy(ad = adOneId))
+          .advanceWatermarkTo(baseTimePlus(31 seconds))
+          .addElements(anyClick.copy(ad = adOneId)) // second Ad1 click
           .advanceWatermarkToInfinity())
       .output(
-        PubsubIO[Ctr](ctrsTopic))(
-        _ should inWindow(window) {
-          containInAnyOrder(Seq(
-            anyCtr.copy(ad = adOneId, impressions = 1, clicks = 1)
-          ))
-        })
+        // TODO: window & pane assertions
+        PubsubIO.readCoder[Event](ctrsTopic))(
+        _ should containInAnyOrder(Seq(
+          anyCtr.copy(ad = adOneId, impressions = 1, clicks = 1),
+          anyCtr.copy(ad = adTwoId, impressions = 2, clicks = 0),
+          anyCtr.copy(ad = adOneId, impressions = 0, clicks = 1)
+        ))
+      )
       .run()
   }
 

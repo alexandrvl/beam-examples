@@ -31,7 +31,9 @@ import org.joda.time.Instant
 
 object CtrWindowExample {
 
-  val WindowDurationConf = "windowDuration"
+  val ImpressionToClickWindowDurationConf = "impressionToClickWindowDuration"
+  val ClickToImpressionWindowDurationConf = "clickToImpressionWindowDuration"
+
   val EventsSubscriptionConf = "eventSubscription"
   val CtrsTopicConf = "ctrTopics"
 
@@ -39,18 +41,29 @@ object CtrWindowExample {
     implicit val (sc, args) = ContextAndArgs(cmdlineArgs)
     sc.optionsAs[StreamingOptions].setStreaming(true)
 
-    val windowDuration = args.int(WindowDurationConf)
+    val impressionToClickWindowDuration = args.int(ImpressionToClickWindowDurationConf, 300)
+    val clickToImpressionWindowDuration = args.int(ClickToImpressionWindowDurationConf, 10)
 
     val eventsSubscription = args.required(EventsSubscriptionConf)
     val ctrsTopic = args.required(CtrsTopicConf)
 
-    val events = sc.pubsubSubscription[Event](eventsSubscription)
-      .withWindowFn(CtrWindowFn(Duration.standardSeconds(windowDuration)))
+    val events = sc.pubsubSubscription[Event](
+      eventsSubscription,
+      idAttribute = Event.IdAttribute, timestampAttribute = Event.TimestampAttribute)
 
-    val eventsByKey = events.keyBy(event => event.key)
-    val ctrs = eventsByKey
+    val eventsById = events
+      .withWindowFn(
+        CtrWindowFn(
+          Duration.standardSeconds(impressionToClickWindowDuration),
+          Duration.standardSeconds(clickToImpressionWindowDuration)
+        ))
+      .keyBy(event => event.emissionId)
+    val ctrs = eventsById
       .sumByKey(new EventSemigroup())
       .values
+
+    ctrs.withWindow.debug()
+    ctrs.withPaneInfo.debug()
 
     ctrs.saveAsPubsub(ctrsTopic)
 
@@ -59,23 +72,23 @@ object CtrWindowExample {
   }
 }
 
-case class ClientId(id: String) extends AnyVal
+case class EmissionId(id: String) extends AnyVal
 
-case class AdId(id: String) extends AnyVal
-
-case class Event(client: ClientId, ad: AdId, impressions: Int = 0, clicks: Int = 0) {
+case class Event(emissionId: EmissionId, impressions: Int = 0, clicks: Int = 0) {
   require(impressions >= 0, s"No of impressions must be non-negative but was $impressions")
   require(clicks >= 0, s"No of clicks must be non-negative but was $clicks")
 
-  lazy val key: (ClientId, AdId) = (client, ad)
   lazy val isImpression: Boolean = clicks == 0 && impressions == 1
   lazy val isClick: Boolean = clicks == 1 && impressions == 0
 }
 
 object Event {
-  def impression(client: ClientId, ad: AdId): Event = new Event(client, ad, impressions = 1)
+  val IdAttribute = "id"
+  val TimestampAttribute = "ts"
 
-  def click(client: ClientId, ad: AdId): Event = new Event(client, ad, clicks = 1)
+  def impression(emissionId: EmissionId): Event = new Event(emissionId, impressions = 1)
+
+  def click(emissionId: EmissionId): Event = new Event(emissionId, clicks = 1)
 
   def ctr(): PartialFunction[Event, Double] = {
     case e: Event if e.impressions != 0 => math.max(e.clicks, 1) / math.max(e.impressions, 1)
@@ -84,23 +97,23 @@ object Event {
 
 class EventSemigroup extends Semigroup[Event] {
   override def plus(e1: Event, e2: Event): Event = {
-    require(e1.key == e2.key)
+    require(e1.emissionId == e2.emissionId)
 
-    new Event(e1.client, e1.ad, e1.impressions + e2.impressions, e1.clicks + e2.clicks)
+    new Event(
+      e1.emissionId,
+      e1.impressions + e2.impressions,
+      e1.clicks + e2.clicks)
   }
 }
 
 class CtrWindow(
     start: Instant,
     end: Instant,
-    client: ClientId,
-    ad: AdId,
-    private val isClick: Boolean
+    val emissionId: EmissionId,
+    val isClick: Boolean
 ) extends IntervalWindow(start, end) {
-  lazy val key: (ClientId, AdId) = (client, ad)
-
   def merge(other: CtrWindow): CtrWindow = {
-    require(key == other.key)
+    require(emissionId == other.emissionId)
 
     val thisStart = start.getMillis
     val thisEnd = end.getMillis
@@ -122,22 +135,24 @@ class CtrWindow(
     new CtrWindow(
       Instant.ofEpochMilli(newStart),
       Instant.ofEpochMilli(newEnd),
-      client,
-      ad,
+      emissionId,
       isClick || other.isClick
     )
   }
 }
 
 object CtrWindow {
-  def forImpression(e: Event, timestamp: Instant, gap: Duration): CtrWindow =
-    new CtrWindow(timestamp, timestamp.plus(gap), e.client, e.ad, false)
+  def forImpression(e: Event, timestamp: Instant, impressionToClickWindowDuration: Duration): CtrWindow =
+    new CtrWindow(timestamp, timestamp.plus(impressionToClickWindowDuration), e.emissionId, false)
 
-  def forClick(e: Event, timestamp: Instant): CtrWindow =
-    new CtrWindow(timestamp, timestamp.plus(1), e.client, e.ad, true)
+  def forClick(e: Event, timestamp: Instant, clickToImpressionWindowDuration: Duration): CtrWindow =
+    new CtrWindow(timestamp, timestamp.plus(clickToImpressionWindowDuration), e.emissionId, true)
 }
 
-class CtrWindowFn(gap: Duration) extends WindowFn[AnyRef, CtrWindow] {
+class CtrWindowFn(
+    impressionToClickWindowDuration: Duration,
+    clickToImpressionWindowDuration: Duration
+) extends WindowFn[AnyRef, CtrWindow] {
 
   import scala.collection.JavaConverters._
 
@@ -145,15 +160,15 @@ class CtrWindowFn(gap: Duration) extends WindowFn[AnyRef, CtrWindow] {
     val event = c.element()
     val timestamp = c.timestamp()
     val ctrWindow = event match {
-      case e: Event if e.isImpression => CtrWindow.forImpression(e, timestamp, gap)
-      case e: Event if e.isClick => CtrWindow.forClick(e, timestamp)
+      case e: Event if e.isImpression => CtrWindow.forImpression(e, timestamp, impressionToClickWindowDuration)
+      case e: Event if e.isClick => CtrWindow.forClick(e, timestamp, clickToImpressionWindowDuration)
     }
     Seq(ctrWindow).asJavaCollection
   }
 
   override def mergeWindows(c: WindowFn[AnyRef, CtrWindow]#MergeContext): Unit = {
     val windows = c.windows().asScala
-    val windowsByKey = windows.groupBy(w => w.key)
+    val windowsByKey = windows.groupBy(w => w.emissionId)
     val mergedWindows = windowsByKey
       .mapValues(ws =>
         ws.reduce { (w1, w2) =>
@@ -177,5 +192,8 @@ class CtrWindowFn(gap: Duration) extends WindowFn[AnyRef, CtrWindow] {
 }
 
 object CtrWindowFn {
-  def apply(gap: Duration): CtrWindowFn = new CtrWindowFn(gap)
+  def apply(
+      impressionToClickWindowDuration: Duration,
+      clickToImpressionWindowDuration: Duration
+  ): CtrWindowFn = new CtrWindowFn(impressionToClickWindowDuration, clickToImpressionWindowDuration)
 }

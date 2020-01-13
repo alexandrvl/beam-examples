@@ -17,15 +17,22 @@
 package org.mkuthan.example
 
 import java.util.Collection
+import java.util.Objects
 
 import com.spotify.scio.ContextAndArgs
 import com.spotify.scio.coders.CoderMaterializer
+import com.spotify.scio.values.WindowOptions
 import com.twitter.algebird.Semigroup
 import org.apache.beam.sdk.coders.Coder
 import org.apache.beam.sdk.options.StreamingOptions
-import org.apache.beam.sdk.transforms.windowing.IntervalWindow
+import org.apache.beam.sdk.transforms.windowing.AfterProcessingTime
+import org.apache.beam.sdk.transforms.windowing.AfterWatermark
+import org.apache.beam.sdk.transforms.windowing.BoundedWindow
+import org.apache.beam.sdk.transforms.windowing.TimestampCombiner
+import org.apache.beam.sdk.transforms.windowing.Window.ClosingBehavior
 import org.apache.beam.sdk.transforms.windowing.WindowFn
 import org.apache.beam.sdk.transforms.windowing.WindowMappingFn
+import org.apache.beam.sdk.values.WindowingStrategy.AccumulationMode
 import org.joda.time.Duration
 import org.joda.time.Instant
 
@@ -33,6 +40,7 @@ object CtrWindowExample {
 
   val ImpressionToClickWindowDurationConf = "impressionToClickWindowDuration"
   val ClickToImpressionWindowDurationConf = "clickToImpressionWindowDuration"
+  val AllowedLatenessConf = "allowedLateness"
 
   val EventsSubscriptionConf = "eventSubscription"
   val CtrsTopicConf = "ctrTopics"
@@ -43,6 +51,7 @@ object CtrWindowExample {
 
     val impressionToClickWindowDuration = args.int(ImpressionToClickWindowDurationConf, 300)
     val clickToImpressionWindowDuration = args.int(ClickToImpressionWindowDurationConf, 10)
+    val allowedLateness = args.int(AllowedLatenessConf, 3600)
 
     val eventsSubscription = args.required(EventsSubscriptionConf)
     val ctrsTopic = args.required(CtrsTopicConf)
@@ -51,13 +60,35 @@ object CtrWindowExample {
       eventsSubscription,
       idAttribute = Event.IdAttribute, timestampAttribute = Event.TimestampAttribute)
 
+    val windowOptions = WindowOptions(
+      trigger = AfterWatermark
+        .pastEndOfWindow()
+        .withEarlyFirings(
+          AfterProcessingTime
+            .pastFirstElementInPane()
+            .plusDelayOf(Duration.standardSeconds(30))
+        )
+        .withLateFirings(
+          AfterProcessingTime
+            .pastFirstElementInPane()
+            .plusDelayOf(Duration.standardSeconds(600))
+        ),
+      accumulationMode = AccumulationMode.ACCUMULATING_FIRED_PANES,
+      allowedLateness = Duration.standardSeconds(allowedLateness),
+      closingBehavior = ClosingBehavior.FIRE_ALWAYS,
+      timestampCombiner = TimestampCombiner.LATEST
+    )
+
     val eventsById = events
       .withWindowFn(
         CtrWindowFn(
           Duration.standardSeconds(impressionToClickWindowDuration),
           Duration.standardSeconds(clickToImpressionWindowDuration)
-        ))
+        ),
+        options = windowOptions
+      )
       .keyBy(event => event.emissionId)
+
     val ctrs = eventsById
       .sumByKey(new EventSemigroup())
       .values
@@ -106,12 +137,31 @@ class EventSemigroup extends Semigroup[Event] {
   }
 }
 
+// TODO: change into case class and get rid of equals/hashCode/toString
 class CtrWindow(
-    start: Instant,
-    end: Instant,
+    val start: Instant,
+    val end: Instant,
     val emissionId: EmissionId,
     val isClick: Boolean
-) extends IntervalWindow(start, end) {
+) extends BoundedWindow {
+
+  override def maxTimestamp(): Instant = end
+
+  override def equals(obj: Any): Boolean =
+    obj match {
+      case other: CtrWindow => start == other.start &&
+        end == other.end &&
+        emissionId == other.emissionId &&
+        isClick == other.isClick
+      case _ => false
+    }
+
+  override def hashCode(): Int =
+    Objects.hash(start, end, emissionId.id, Boolean.box(isClick))
+
+  override def toString: String =
+    s"CtrWindow{start=$start, end=$end, emissionId='${emissionId.id}', isClick='$isClick'}"
+
   def merge(other: CtrWindow): CtrWindow = {
     require(emissionId == other.emissionId)
 
@@ -149,6 +199,7 @@ object CtrWindow {
     new CtrWindow(timestamp, timestamp.plus(clickToImpressionWindowDuration), e.emissionId, true)
 }
 
+// TODO: change Window[AnyRef, CtrWindow] into Window[Event, CtrWindow]
 class CtrWindowFn(
     impressionToClickWindowDuration: Duration,
     clickToImpressionWindowDuration: Duration

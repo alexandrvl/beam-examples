@@ -21,7 +21,6 @@ import scala.concurrent.duration._
 import com.spotify.scio.io.PubsubIO
 import com.spotify.scio.testing.PipelineSpec
 import com.spotify.scio.testing.testStreamOf
-import org.apache.beam.sdk.transforms.windowing.IntervalWindow
 import org.apache.beam.sdk.values.TimestampedValue
 import org.joda.time.{Duration => JDuration}
 import org.joda.time.{Instant => JInstant}
@@ -42,7 +41,7 @@ class CtrWindowExampleTest extends PipelineSpec {
 
   "CTR" should "be calculated from one impression and click in the same window" in {
 
-    val window = new IntervalWindow(at(1 second), at(20 seconds))
+    val window = new CtrWindow(at(1 second), at(250 seconds), anyEmissionId, true)
 
     JobTest[CtrWindowExample.type]
       .args(
@@ -56,7 +55,7 @@ class CtrWindowExampleTest extends PipelineSpec {
         testStreamOf[Event]
           .advanceWatermarkTo(baseTime)
           .addElements(eventAt(anyImpression, 1 second))
-          .addElements(eventAt(anyClick, 10 seconds))
+          .addElements(eventAt(anyClick, 250 seconds))
           .advanceWatermarkToInfinity())
       .output(
         // TODO: window & pane assertions
